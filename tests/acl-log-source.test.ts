@@ -288,7 +288,7 @@ describe("chain log sources", () => {
     }
   });
 
-  it("uses the Blockscout PRO endpoint and redacts its key", async () => {
+  it("uses the instance the registry names, and redacts the key it sends", async () => {
     const previous = process.env.BLOCKSCOUT_API_KEY;
     process.env.BLOCKSCOUT_API_KEY = "proapi_test_secret";
     const urls: string[] = [];
@@ -301,8 +301,8 @@ describe("chain log sources", () => {
       const result = await collectRoleEvents("8453", CONTRACT, { fromBlock: 1, toBlock: 2 });
       assert.equal(result.ok, true);
       const url = new URL(urls[0]);
-      assert.equal(url.origin + url.pathname, "https://api.blockscout.com/v2/api");
-      assert.equal(url.searchParams.get("chain_id"), "8453");
+      // The instance the registry names, not the aggregator, which upstream main already does.
+      assert.equal(url.origin + url.pathname, "https://base.blockscout.com/api");
       assert.equal(url.searchParams.get("apikey"), "proapi_test_secret");
       assert.ok(!redactSecrets(urls[0]).includes("proapi_test_secret"));
     } finally {
