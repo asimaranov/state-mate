@@ -39,6 +39,8 @@ import {
   SUCCESS_MARK,
   WARNING_MARK,
 } from "./logger";
+import { beginObservedSection, writeObservedFile } from "./observed";
+import { pinSectionBlock } from "./pinned-block";
 import { beginConfig, emitReport, endConfig } from "./report";
 import { ContractSectionValidator } from "./section-validators/contract";
 import {
@@ -288,6 +290,10 @@ async function checkNetworkSection(sectionTitle: string, section: NetworkSection
   // assertProviderChain vouches for the RPC; the explorer is probed by the ABI pass, and only
   // when it has something to download
   await assertProviderChain(provider, chainId);
+  const block = await pinSectionBlock(provider);
+  if (context.observedPath) {
+    beginObservedSection(sectionTitle, chainId, block ?? (await provider.getBlockNumber()), block !== undefined);
+  }
   const contractSectionChecker = new ContractSectionValidator(provider, chainId);
 
   for (const contractAlias in section.contracts) {
@@ -326,6 +332,14 @@ async function main() {
     if (context.checkOnly) {
       logErrorAndExit(`The ${chalk.yellow("-o")} option requires a single config file, not a directory`);
     }
+    if (context.observedPath) {
+      logErrorAndExit(`The ${chalk.yellow("--observed")} option requires a single config file, not a directory`);
+    }
+    if (context.block !== undefined && context.block !== "latest") {
+      logErrorAndExit(
+        `A numbered ${chalk.yellow("--block")} requires a single config file; a directory takes --block latest`,
+      );
+    }
     const configs = collectYamlConfigs(context.configPath);
     if (configs.length === 0) {
       logErrorAndExit(`No YAML configs found in ${chalk.magenta(context.configPath)}`);
@@ -360,7 +374,12 @@ async function main() {
   beginConfig(context.configPath);
   await runConfig();
   endConfig();
+  flushObserved();
   exit(stats.errors);
+}
+
+function flushObserved(): void {
+  if (context.observedPath) writeObservedFile(context.observedPath, context.configPath);
 }
 
 // Under --json the report owns the exit code; the log mode keeps exiting on the spot
@@ -384,6 +403,7 @@ async function runConfig() {
 // Do not run when imported (e.g. by unit tests) — only as the CLI entrypoint
 if (require.main === module) {
   main().catch((error) => {
+    flushObserved();
     if (context.json) {
       emitReport(1, printError(error));
       // A FatalError is fully told by the report; anything else is a bug worth its stack
