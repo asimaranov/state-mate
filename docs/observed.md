@@ -10,7 +10,9 @@ kept, diffed and re-read.
 
 Every `eth_call`, `eth_getStorageAt`, `eth_getCode` and `eth_getBalance` of the run names this
 block instead of `latest`, and the ACL log scans end at it. With `latest` the block is resolved
-once per network section, when the section starts.
+once per network section, when the section starts. A pin at least the chain's confirmation lag
+behind the head is settled, so the explorer, or the section's `logsRpcUrl`, serves the ACL logs
+all the way to it and no RPC tail is read.
 
 Without the option each read is served at whatever block is the head at that moment, so a list
 and its length can come from different blocks. A vault that deallocates a market between the
