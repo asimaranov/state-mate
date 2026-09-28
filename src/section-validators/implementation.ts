@@ -23,6 +23,9 @@ const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
 // slot holds an ordinary variable, and an address-shaped one would fake a mismatch
 const SAFE_SINGLETON_SLOT = "0x0";
 const SAFE_PROXY_NAMES = new Set(["SafeProxy", "GnosisSafeProxy"]);
+// EIP-1167 minimal proxy runtime: PUSHn <address>, then a JUMPI whose destination moves with n.
+// The standard pushes 20 bytes; vanity clones of an address with leading zero bytes push fewer
+const EIP1167_RUNTIME = /^0x363d3d373d3d3d363d(6[0-9a-f]|7[0-3])([0-9a-f]*)5af43d82803e903d9160([0-9a-f]{2})57fd5bf3$/i;
 
 const BYPASS_HINT = `pass ${chalk.yellow("--skip-implementation-check")} to skip this check`;
 
@@ -53,6 +56,23 @@ async function readSlotWord(
 async function callWord(provider: JsonRpcProvider, address: string, selector: string): Promise<string | undefined> {
   try {
     return await provider.call({ data: selector, to: address });
+  } catch {
+    return undefined;
+  }
+}
+
+/** The address an EIP-1167 clone delegates to, read from its own bytecode. */
+export function cloneTarget(code: string): string | undefined {
+  const match = EIP1167_RUNTIME.exec(code);
+  if (!match) return undefined;
+  const pushed = Number.parseInt(match[1], 16) - 0x5f;
+  if (match[2].length !== pushed * 2 || Number.parseInt(match[3], 16) !== 0x17 + pushed) return undefined;
+  return addressFromWord(`0x${match[2].padStart(64, "0")}`);
+}
+
+async function readCloneTarget(provider: JsonRpcProvider, address: string): Promise<string | undefined> {
+  try {
+    return cloneTarget(await provider.getCode(address));
   } catch {
     return undefined;
   }
@@ -173,6 +193,7 @@ export async function checkImplementation(provider: JsonRpcProvider, contractEnt
         // The config calls it a proxy; a getter may still name the implementation the empty
         // EIP-1967 slot did not, and either way "not a proxy" would contradict the config
         const viaGetter =
+          (await readCloneTarget(provider, address)) ??
           (await callAsAddress(provider, address, IMPLEMENTATION_SELECTOR)) ??
           (await callAsAddress(provider, address, PROXY_GET_IMPLEMENTATION_SELECTOR));
         const complaint = viaGetter
@@ -186,8 +207,10 @@ export async function checkImplementation(provider: JsonRpcProvider, contractEnt
       return;
     }
 
-    // The config declares this one a proxy, so the riskier reads are safe to try
-    actual = slotImplementation ?? (await callAsAddress(provider, address, IMPLEMENTATION_SELECTOR));
+    // The config declares this one a proxy, so the riskier reads are safe to try. The bytecode
+    // goes before the getters: a clone forwards every call, so a getter answers for its target
+    actual = slotImplementation ?? (await readCloneTarget(provider, address));
+    actual ??= await callAsAddress(provider, address, IMPLEMENTATION_SELECTOR);
     actual ??= await callAsAddress(provider, address, PROXY_GET_IMPLEMENTATION_SELECTOR);
   }
 

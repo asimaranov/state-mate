@@ -5,7 +5,7 @@ import type { JsonRpcProvider } from "ethers";
 
 import { context, resetStats, stats } from "../src/context";
 import { resetContractCounters } from "../src/section-validators/base";
-import { checkImplementation, checkProxyAdmin } from "../src/section-validators/implementation";
+import { checkImplementation, checkProxyAdmin, cloneTarget } from "../src/section-validators/implementation";
 import type { ContractEntry } from "../src/typebox";
 
 const PROXY_ADDRESS = "0xAaAaAAaaAaAAAaaAAaAaaaAAaAAAaaaAaaaaaaa1";
@@ -23,9 +23,20 @@ function word(address: string): string {
   return `0x${"0".repeat(24)}${address.slice(2).toLowerCase()}`;
 }
 
+/** EIP-1167 runtime pushing `bytes` of the address; the jump destination moves with the push. */
+function cloneCode(address: string, bytes = 20, jumpdest = 0x17 + bytes): string {
+  const push = (0x5f + bytes).toString(16);
+  const pushed = address
+    .slice(2)
+    .toLowerCase()
+    .slice(40 - bytes * 2);
+  return `0x363d3d373d3d3d363d${push}${pushed}5af43d82803e903d9160${jumpdest.toString(16)}57fd5bf3`;
+}
+
 type ProviderStub = {
   callResult?: Error | string;
   calls?: Record<string, Error | string>;
+  code?: string;
   selectors?: Record<string, Error | string>;
   slotErrors?: Record<string, Error>;
   slots?: Record<string, string>;
@@ -40,6 +51,10 @@ function stubProvider(stub: ProviderStub): { provider: JsonRpcProvider; reads: s
       const answer = stub.selectors?.[data] ?? stub.calls?.[to.toLowerCase()] ?? stub.callResult;
       if (answer instanceof Error) throw answer;
       return answer ?? ZERO_WORD;
+    },
+    async getCode(address: string) {
+      reads.push(`code:${address.toLowerCase()}`);
+      return stub.code ?? "0x";
     },
     async getStorage(_address: string, slot: string) {
       reads.push(`slot:${slot}`);
@@ -150,7 +165,47 @@ describe("checkImplementation", () => {
     await checkImplementation(provider, proxyEntry(IMPL_ADDRESS));
 
     assert.equal(stats.errors, 0);
-    assert.deepEqual(reads, [`slot:${EIP1967_SLOT}`, `call:${PROXY_ADDRESS.toLowerCase()}`]);
+    assert.deepEqual(reads, [
+      `slot:${EIP1967_SLOT}`,
+      `code:${PROXY_ADDRESS.toLowerCase()}`,
+      `call:${PROXY_ADDRESS.toLowerCase()}`,
+    ]);
+  });
+
+  it("resolves a declared EIP-1167 clone from the address its bytecode embeds", async () => {
+    // a clone keeps no slot and answers no getter of its own: a getter call is forwarded
+    const { provider, reads } = stubProvider({
+      callResult: new Error("execution reverted"),
+      code: cloneCode(IMPL_ADDRESS),
+    });
+
+    await checkImplementation(provider, proxyEntry(IMPL_ADDRESS, "MinimalProxy"));
+
+    assert.equal(stats.errors, 0);
+    assert.equal(stats.totalChecks, 1);
+    // the bytecode is the clone's own word, so the forwarded getters are never asked
+    assert.deepEqual(reads, [`slot:${EIP1967_SLOT}`, `code:${PROXY_ADDRESS.toLowerCase()}`]);
+  });
+
+  it("reports the target of a clone that delegates elsewhere than declared", async () => {
+    const { provider } = stubProvider({ code: cloneCode(OTHER_IMPL_ADDRESS) });
+
+    await checkImplementation(provider, proxyEntry(IMPL_ADDRESS, "MinimalProxy"));
+
+    assert.equal(stats.errors, 1);
+    assert.match(stats.errorDetails[0].message, new RegExp(`delegates to ${OTHER_IMPL_ADDRESS}`, "i"));
+  });
+
+  it("names a clone's target when the config pins no implementation", async () => {
+    const { provider } = stubProvider({ callResult: new Error("execution reverted"), code: cloneCode(IMPL_ADDRESS) });
+
+    await checkImplementation(provider, proxyEntry(undefined, "MinimalProxy"));
+
+    assert.equal(stats.errors, 1);
+    assert.match(
+      stats.errorDetails[0].message,
+      new RegExp(`${IMPL_ADDRESS}, but the config pins no implementation`, "i"),
+    );
   });
 
   it("reads only the singleton slot for a Safe, skipping the getters a Safe never answers", async () => {
@@ -565,5 +620,33 @@ describe("checkProxyAdmin", () => {
 
     assert.equal(stats.errors, 2);
     for (const detail of stats.errorDetails) assert.match(detail.message, /could not be read/);
+  });
+});
+
+describe("EIP-1167 runtime", () => {
+  it("reads the standard 45-byte clone", () => {
+    assert.equal(cloneTarget(cloneCode(IMPL_ADDRESS))?.toLowerCase(), IMPL_ADDRESS.toLowerCase());
+    assert.equal(
+      cloneTarget(cloneCode(IMPL_ADDRESS).toUpperCase().replace("0X", "0x"))?.toLowerCase(),
+      IMPL_ADDRESS.toLowerCase(),
+    );
+  });
+
+  it("reads a vanity clone that pushes an address with leading zero bytes in fewer bytes", () => {
+    const vanity = "0x00000000AbCdEf0123456789aBcDeF0123456789";
+    // PUSH16 and a jump to 0x27: the layout of the widely deployed 41-byte variant
+    assert.match(cloneCode(vanity, 16), /6f[0-9a-f]{32}5af43d82803e903d91602757fd5bf3$/);
+    assert.equal(cloneTarget(cloneCode(vanity, 16))?.toLowerCase(), vanity.toLowerCase());
+  });
+
+  it("takes nothing that is merely close to a clone", () => {
+    // a jump destination that does not match the push, a push that does not match its bytes,
+    // trailing code, the zero address, and a plain contract
+    assert.equal(cloneTarget(cloneCode(IMPL_ADDRESS, 20, 0x27)), undefined);
+    assert.equal(cloneTarget(cloneCode(IMPL_ADDRESS).replace("3d73", "3d72")), undefined);
+    assert.equal(cloneTarget(`${cloneCode(IMPL_ADDRESS)}00`), undefined);
+    assert.equal(cloneTarget(cloneCode(`0x${"0".repeat(40)}`)), undefined);
+    assert.equal(cloneTarget("0x6080604052348015600f57600080fd5b50"), undefined);
+    assert.equal(cloneTarget("0x"), undefined);
   });
 });

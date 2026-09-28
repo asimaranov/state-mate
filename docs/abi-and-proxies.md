@@ -25,7 +25,7 @@ During `--update-abi`, an explorer that no longer serves a stored contract does 
 
 Proxy calls execute at the proxy address but use the implementation interface. state-mate resolves `checks` with the ABI at `implementation` and resolves `proxyChecks` with the ABI at `address`.
 
-For each declared `implementation`, state-mate reads the EIP-1967 implementation slot, then falls back to `implementation()` and `proxy__getImplementation()`. Safe proxies use slot `0` because they do not expose those getters. Aragon proxies and Safes must be declared explicitly because they store their implementation outside EIP-1967.
+For each declared `implementation`, state-mate reads the EIP-1967 implementation slot, then the address an EIP-1167 minimal proxy embeds in its bytecode, then falls back to `implementation()` and `proxy__getImplementation()`. Safe proxies use slot `0` because they do not expose those getters. Aragon proxies and Safes must be declared explicitly because they store their implementation outside EIP-1967.
 
 An entry without `implementation` must have an empty EIP-1967 implementation slot. This prevents a proxy from being described as a regular contract and checked with the wrong ABI. An unreadable implementation fails the check; `--skip-implementation-check` is the explicit bypass.
 
