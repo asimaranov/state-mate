@@ -2,6 +2,7 @@ import chalk from "chalk";
 import { Contract, JsonRpcProvider } from "ethers";
 
 import { printError } from "./common";
+import { context } from "./context";
 import { log, logErrorAndExit, WARNING_MARK } from "./logger";
 import { pinBlockTag, toBlockTag } from "./pinned-block";
 import {
@@ -38,6 +39,8 @@ class ExplorerHttpError extends Error {
     message: string,
     readonly transient: boolean,
     readonly retryDelayMs = 0,
+    // the refusal's own Retry-After, when it stated one
+    readonly retryAfterMs?: number,
   ) {
     super(message);
   }
@@ -256,6 +259,7 @@ export async function httpGetAsync<T>(url: string): Promise<T> {
       `Failed to fetch contract source code: HTTP status code ${response.status}: ${response.statusText}`,
       isTransientHttpStatus(response.status),
       response.status === 429 ? Math.max(paced, RATE_LIMIT_RETRY_MS) : 0,
+      retryAfterMs(response.headers),
     );
   }
   try {
@@ -281,55 +285,101 @@ function _hexToDecimal(value: unknown): string | undefined {
   return typeof value === "string" && /^0x[0-9a-fA-F]+$/.test(value) ? BigInt(value).toString() : undefined;
 }
 
+/** Retry-After in seconds or as an HTTP date; undefined when the refusal states none. */
+export function retryAfterMs(headers: Headers | undefined, now = Date.now()): number | undefined {
+  const stated = headers?.get?.("retry-after")?.trim();
+  if (!stated) return undefined;
+  if (/^\d+$/.test(stated)) return Number(stated) * 1000;
+  const at = Date.parse(stated);
+  return Number.isNaN(at) ? undefined : Math.max(0, at - now);
+}
+
+// A probe nobody answered blocks ABI downloads outright, so a refusal is waited out rather than
+// taken for the answer: a few attempts per route, one wait budget for the whole probe
+const PROBE_ATTEMPTS = 4;
+const PROBE_WAIT_BUDGET_MS = 60 * 1000;
+
+/** The chain the explorer named, how long to wait before asking again, or undefined: asking cannot help. */
+type ProbeAnswer = { chainId: string } | { waitMs: number } | undefined;
+
+// A rate limit that states no Retry-After waits the free-tier pause, doubled on every refusal
+const probeBackoff = (attempt: number) => RATE_LIMIT_RETRY_MS * 2 ** attempt;
+
+function readProbeAnswer(body: { message?: unknown; result?: unknown }, attempt: number): ProbeAnswer {
+  const decimal = _hexToDecimal(body.result);
+  if (decimal !== undefined) return { chainId: decimal };
+  // a rate-limited answer arrives as HTTP 200 with a JSON complaint; anything else means the
+  // host does not serve this route
+  const answer = `${String(body.message ?? "")} ${JSON.stringify(body.result ?? "")}`;
+  return /rate limit/i.test(answer) ? { waitMs: probeBackoff(attempt) } : undefined;
+}
+
+async function probeRoute(
+  budget: { waitedMs: number },
+  ask: (attempt: number) => Promise<ProbeAnswer>,
+): Promise<string | undefined> {
+  for (let attempt = 0; attempt < PROBE_ATTEMPTS; attempt++) {
+    const answer = await ask(attempt);
+    if (answer === undefined) return undefined;
+    if ("chainId" in answer) return answer.chainId;
+    if (attempt + 1 === PROBE_ATTEMPTS || budget.waitedMs + answer.waitMs > PROBE_WAIT_BUDGET_MS) return undefined;
+    budget.waitedMs += answer.waitMs;
+    if (answer.waitMs > 0) await sleep(answer.waitMs);
+  }
+  return undefined;
+}
+
 export async function fetchExplorerChainId(
   explorerHostname: string,
   explorerKey?: string,
 ): Promise<string | undefined> {
-  // A probe nobody answered blocks ABI downloads outright, so each route gets its own bounded
-  // retry on a flake; the two-fetch budget of loadContractInfo is not involved.
+  const budget = { waitedMs: 0 };
   // The eth-rpc route is the one every checked blockscout actually serves, so giving up on it
   // early would send the probe to a fallback that answers "Unknown module"
-  for (let attempt = 0; attempt < 2; attempt++) {
+  const rpcUrl = `https://${explorerHostname}/api/eth-rpc`;
+  const served = await probeRoute(budget, async (attempt) => {
+    let response: Response;
     try {
-      const response = await fetch(`https://${explorerHostname}/api/eth-rpc`, {
+      response = await fetch(rpcUrl, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { ...explorerHeaders(rpcUrl), "Content-Type": "application/json" },
         body: JSON.stringify({ jsonrpc: "2.0", method: "eth_chainId", params: [], id: 1 }),
       });
-      if (!response.ok) {
-        if (!isTransientHttpStatus(response.status) || attempt > 0) break;
-        if (response.status === 429) await sleep(RATE_LIMIT_RETRY_MS);
-        continue;
-      }
-      const decimal = _hexToDecimal(((await response.json()) as { result?: unknown }).result);
-      if (decimal !== undefined) return decimal;
-      // the host answered without a chainId: it does not serve this route
-      break;
     } catch {
-      if (attempt > 0) break;
-      /* a network flake: one more try, then the etherscan-compatible endpoint */
+      return { waitMs: 0 }; // a network flake
     }
-  }
+    if (!response.ok) {
+      if (!isTransientHttpStatus(response.status)) return undefined;
+      return { waitMs: retryAfterMs(response.headers) ?? (response.status === 429 ? probeBackoff(attempt) : 0) };
+    }
+    try {
+      return readProbeAnswer((await response.json()) as { message?: unknown; result?: unknown }, attempt);
+    } catch {
+      return { waitMs: 0 };
+    }
+  });
+  if (served !== undefined) return served;
 
   let url = `https://${explorerHostname}/api?module=proxy&action=eth_chainId`;
   if (explorerKey) {
     url += `&apikey=${explorerKey}`;
   }
-  for (let attempt = 0; attempt < 2; attempt++) {
+  return probeRoute(budget, async (attempt) => {
     try {
-      const response = await httpGetAsync<{ message?: unknown; result?: unknown }>(url);
-      const decimal = _hexToDecimal(response.result);
-      if (decimal !== undefined) return decimal;
-      // a rate-limited answer arrives as HTTP 200 with a JSON complaint; worth the second try
-      const answer = `${String(response.message ?? "")} ${JSON.stringify(response.result ?? "")}`;
-      if (!/rate limit/i.test(answer) || attempt > 0) return undefined;
-      await sleep(RATE_LIMIT_RETRY_MS);
+      return readProbeAnswer(await httpGetAsync<{ message?: unknown; result?: unknown }>(url), attempt);
     } catch (error) {
-      if (!(error instanceof ExplorerHttpError) || !error.transient || attempt > 0) return undefined;
-      if (error.retryDelayMs) await sleep(error.retryDelayMs);
+      if (!(error instanceof ExplorerHttpError) || !error.transient) return undefined;
+      // retryDelayMs is the pacer's interval for this host after a 429, and nothing otherwise
+      const paced = error.retryDelayMs > 0 ? Math.max(probeBackoff(attempt), error.retryDelayMs) : 0;
+      return { waitMs: error.retryAfterMs ?? paced };
     }
-  }
-  return undefined;
+  });
+}
+
+/** "<host>=<chainId>", the form --trusted-explorer takes; null when the text is not that. */
+export function parseTrustedExplorer(text: string): [string, string] | null {
+  const match = /^([a-z0-9-]+(?:\.[a-z0-9-]+)*(?::\d+)?)=([1-9]\d*)$/i.exec(text.trim());
+  return match ? [match[1].toLowerCase(), match[2]] : null;
 }
 
 const TRANSIENT_RPC_RETRY_MS = 2000;
@@ -410,6 +460,19 @@ export async function verifyChainIdWithExplorer(
   // etherscan v2 takes the chain as a request parameter, so the host cannot disagree with it;
   // only a host that serves a single fixed chain can contradict the config
   if (explorerHostname.includes("etherscan.io")) return true;
+
+  // The caller already knows which chain this host serves; asking the host would only spend its
+  // rate limit, and robinhoodchain.blockscout.com answers the probe with 429
+  const trusted = context.trustedExplorers[explorerHostname.toLowerCase()];
+  if (trusted !== undefined) {
+    if (trusted !== chainId) {
+      logErrorAndExit(
+        `${chalk.yellow("--trusted-explorer")} names chain ${chalk.yellow(trusted)} for ${chalk.magenta(explorerHostname)}, while the config expects ${chalk.yellow(chainId)}`,
+      );
+    }
+    log(`Explorer ${chalk.magenta(explorerHostname)} trusted for chainId ${chainId}, not probed`);
+    return true;
+  }
 
   // one probe per host and chain: the ABI pass and the checks pass ask about the same sections
   const memoKey = `${explorerHostname}|${chainId}`;

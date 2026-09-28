@@ -7,8 +7,9 @@ import { normalizeChainId } from "../src/common";
 import { context, resetStats, stats } from "../src/context";
 import {
   assertProviderChain,
-  loadContractInfo,
   learnRateLimit,
+  loadContractInfo,
+  parseTrustedExplorer,
   reserveRequestSlot,
   resetRequestSlots,
   verifyChainIdWithExplorer,
@@ -128,6 +129,59 @@ describe("verifyChainIdWithExplorer", () => {
       assert.equal(fetchMock.mock.calls.length, callsAfterFirst);
     } finally {
       fetchMock.mock.restore();
+    }
+  });
+});
+
+describe("a trusted explorer", () => {
+  it("vouches for its chain without being probed", async () => {
+    // the pipeline knows robinhoodchain.blockscout.com serves 4663; the host answers the probe
+    // with 429, and an unanswered probe blocked every ABI download of the run
+    context.trustedExplorers = { "robinhoodchain.blockscout.com": "4663" };
+    const fetchMock = mock.method(globalThis, "fetch", async () => {
+      throw new Error("no probe expected");
+    });
+    try {
+      const { result } = await captureLog(() => verifyChainIdWithExplorer("RobinhoodChain.blockscout.com", "4663"));
+      assert.equal(result, true);
+      assert.equal(fetchMock.mock.calls.length, 0);
+    } finally {
+      fetchMock.mock.restore();
+      context.trustedExplorers = {};
+    }
+  });
+
+  it("refuses a config whose chain the trusted map contradicts", async () => {
+    context.trustedExplorers = { "robinhoodchain.blockscout.com": "4663" };
+    const fetchMock = mock.method(globalThis, "fetch", async () => {
+      throw new Error("no probe expected");
+    });
+    try {
+      const message = await captureExit(() => verifyChainIdWithExplorer("robinhoodchain.blockscout.com", "1"));
+      assert.match(message ?? "", /--trusted-explorer/);
+      assert.match(message ?? "", /4663/);
+      assert.equal(fetchMock.mock.calls.length, 0);
+    } finally {
+      fetchMock.mock.restore();
+      context.trustedExplorers = {};
+    }
+  });
+
+  it("is given as host=chainId and nothing looser", () => {
+    assert.deepEqual(parseTrustedExplorer("robinhoodchain.blockscout.com=4663"), [
+      "robinhoodchain.blockscout.com",
+      "4663",
+    ]);
+    assert.deepEqual(parseTrustedExplorer(" Explorer.Example:8443=10 "), ["explorer.example:8443", "10"]);
+    for (const text of [
+      "https://explorer.example=1",
+      "explorer.example=0",
+      "explorer.example=0x1",
+      "explorer.example",
+      "=1",
+      "a=1=2",
+    ]) {
+      assert.equal(parseTrustedExplorer(text), null, text);
     }
   });
 });

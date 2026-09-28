@@ -19,7 +19,7 @@ import {
 } from "../src/abi-provider";
 import { EntryField } from "../src/common";
 import { context, resetStats, stats } from "../src/context";
-import { fetchExplorerChainId } from "../src/explorer";
+import { fetchExplorerChainId, resetRequestSlots, retryAfterMs } from "../src/explorer";
 import { SectionValidatorBase } from "../src/section-validators/base";
 import * as stateMate from "../src/state-mate";
 import type { ContractEntry, EntireDocument } from "../src/typebox";
@@ -690,26 +690,108 @@ describe("fetchExplorerChainId", () => {
     }
   });
 
-  it("gives the fallback probe two attempts at most", async () => {
-    let fallbackCalls = 0;
-    const fetchMock = mock.method(globalThis, "fetch", async (url: Parameters<typeof fetch>[0]) => {
-      if (String(url).includes("eth-rpc")) {
-        return { ok: true, json: async () => ({ status: "0", message: "NOTOK", result: "no rpc here" }) } as Response;
-      }
-      fallbackCalls++;
-      return { ok: false, status: 429, statusText: "Too Many Requests" } as Response;
+  /** Runs the probe under mocked clocks, a second at a time, and reports the time it waited. */
+  async function settle<T>(start: () => Promise<T>): Promise<{ elapsedMs: number; value: T }> {
+    resetRequestSlots();
+    mock.timers.enable({ apis: ["setTimeout", "Date"], now: 1_000_000 });
+    let done = false;
+    const pending = start().finally(() => {
+      done = true;
     });
-    mock.timers.enable({ apis: ["setTimeout"] });
+    let elapsedMs = 0;
     try {
-      const pending = fetchExplorerChainId("api.bscscan.com");
-      for (let round = 0; round < 8; round++) {
-        await new Promise((resolve) => setImmediate(resolve));
-        mock.timers.tick(7000);
+      for (let round = 0; round < 500 && !done; round++) {
+        for (let turn = 0; turn < 5; turn++) await new Promise((resolve) => setImmediate(resolve));
+        if (done) break;
+        mock.timers.tick(1000);
+        elapsedMs += 1000;
       }
-      assert.equal(await pending, undefined);
-      assert.equal(fallbackCalls, 2);
+      // a probe still waiting after this much mocked time would otherwise hang the suite
+      if (!done) throw new Error(`the probe had not settled after ${elapsedMs} ms of mocked time`);
+      return { elapsedMs, value: await pending };
     } finally {
       mock.timers.reset();
+      resetRequestSlots();
+    }
+  }
+
+  it("keeps asking a host that answers 429, within a few attempts and one minute of waiting", async () => {
+    // robinhoodchain.blockscout.com answers the probe with 429; one retry after six seconds gave
+    // up on it and took every ABI download of the run down with it
+    let primaryCalls = 0;
+    let fallbackCalls = 0;
+    const fetchMock = mock.method(globalThis, "fetch", async (url: Parameters<typeof fetch>[0]) => {
+      if (String(url).includes("eth-rpc")) primaryCalls++;
+      else fallbackCalls++;
+      return new Response("rate limited", { status: 429, statusText: "Too Many Requests" });
+    });
+    try {
+      const { elapsedMs, value } = await settle(() => fetchExplorerChainId("stubborn.blockscout.example"));
+      assert.equal(value, undefined);
+      assert.equal(primaryCalls, 4);
+      assert.equal(fallbackCalls, 3);
+      assert.ok(elapsedMs <= 61_000, `${elapsedMs} ms`);
+    } finally {
+      fetchMock.mock.restore();
+    }
+  });
+
+  it("waits what Retry-After asks before asking again", async () => {
+    let calls = 0;
+    const fetchMock = mock.method(globalThis, "fetch", async () => {
+      calls++;
+      if (calls === 1) return new Response(null, { headers: { "retry-after": "20" }, status: 429 });
+      return Response.json({ id: 1, jsonrpc: "2.0", result: "0x1237" });
+    });
+    try {
+      const { elapsedMs, value } = await settle(() => fetchExplorerChainId("patient.blockscout.example"));
+      assert.equal(value, "4663");
+      assert.equal(calls, 2);
+      assert.ok(elapsedMs >= 20_000 && elapsedMs <= 21_000, `${elapsedMs} ms`);
+    } finally {
+      fetchMock.mock.restore();
+    }
+  });
+
+  it("does not wait out a Retry-After longer than the probe's budget", async () => {
+    let calls = 0;
+    const fetchMock = mock.method(globalThis, "fetch", async () => {
+      calls++;
+      return new Response(null, { headers: { "retry-after": "3600" }, status: 429 });
+    });
+    try {
+      const { elapsedMs, value } = await settle(() => fetchExplorerChainId("closed.blockscout.example"));
+      assert.equal(value, undefined);
+      assert.equal(calls, 2, "one request per route");
+      assert.ok(elapsedMs <= 1000, `${elapsedMs} ms`);
+    } finally {
+      fetchMock.mock.restore();
+    }
+  });
+
+  it("reads Retry-After in seconds and as an HTTP date", () => {
+    const now = Date.UTC(2026, 8, 28, 12, 0, 0);
+    assert.equal(retryAfterMs(new Headers({ "retry-after": "7" }), now), 7000);
+    assert.equal(retryAfterMs(new Headers({ "retry-after": new Date(now + 30_000).toUTCString() }), now), 30_000);
+    assert.equal(retryAfterMs(new Headers(), now), undefined);
+    assert.equal(retryAfterMs(new Headers({ "retry-after": "soon" }), now), undefined);
+  });
+
+  it("sends the probe POST with the Referer and User-Agent the ABI requests carry", async () => {
+    // a Cloudflare-fronted instance answers a request without a same-origin Referer with 403
+    const sent: RequestInit[] = [];
+    const fetchMock = mock.method(globalThis, "fetch", async (_url: unknown, init?: RequestInit) => {
+      sent.push(init ?? {});
+      return Response.json({ id: 1, jsonrpc: "2.0", result: "0x1237" });
+    });
+    try {
+      assert.equal(await fetchExplorerChainId("robinhoodchain.blockscout.com"), "4663");
+      const headers = new Headers(sent[0].headers);
+      assert.equal(sent[0].method, "POST");
+      assert.equal(headers.get("referer"), "https://robinhoodchain.blockscout.com/");
+      assert.match(headers.get("user-agent") ?? "", /state-mate/);
+      assert.equal(headers.get("content-type"), "application/json");
+    } finally {
       fetchMock.mock.restore();
     }
   });

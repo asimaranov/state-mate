@@ -17,7 +17,7 @@ state-mate keeps one compressed `abis.json.gz` beside each group of configs. Ent
 
 The chain ID prevents collisions when different networks deploy contracts at the same address. The YAML `name` must match the contract or implementation ABI. When `proxyChecks` run, `proxyName` must match the proxy ABI.
 
-Etherscan V2 receives the configured chain ID with each request. Before a download from a fixed-chain explorer, state-mate verifies that the explorer serves the configured network. A run with a complete ABI store does not contact the explorer.
+Etherscan V2 receives the configured chain ID with each request. Before a download from a fixed-chain explorer, state-mate verifies that the explorer serves the configured network. A run with a complete ABI store does not contact the explorer. A refused probe is retried a few times, waiting what `Retry-After` asks, or 6, 12, 24 seconds when it asks nothing, within one minute for the whole probe. A caller that already knows the host's chain passes `--trusted-explorer <host>=<chainId>`: that host is not probed, and a config naming another chain for it stops the run.
 
 During `--update-abi`, an explorer that no longer serves a stored contract does not erase the existing ABI. A section without `explorerHostname` also keeps its stored entries.
 

@@ -34,6 +34,8 @@ export const context = {
   observedPath: undefined as string | undefined,
   // --expand-enumerations: read every element behind a pinned <name>Length and report the unpinned ones
   expandEnumerations: false,
+  // --trusted-explorer: lowercase explorer host -> the decimal chainId it is known to serve
+  trustedExplorers: {} as Record<string, string>,
 };
 
 // Values read from the environment that no report may echo back: RPC URLs carry keys, and

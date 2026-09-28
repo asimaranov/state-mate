@@ -2,6 +2,7 @@ import { CommanderError, program } from "commander";
 
 import { EntryField, printError } from "./common";
 import { type CheckOnly, context } from "./context";
+import { parseTrustedExplorer } from "./explorer";
 import { FatalError, logErrorAndExit } from "./logger";
 import { parseBlockOption } from "./pinned-block";
 
@@ -22,7 +23,13 @@ export function parseCommandLineArguments() {
     .option("-J, --json", "one JSON report on stdout: verdict, counters, failed checks; see docs/json-output.md")
     .option("--block <number|latest>", "read every value at this block; 'latest' is resolved once per section")
     .option("--observed <file>", "write every value the chain answered, with its block, to this YAML file")
-    .option("--expand-enumerations", "read every element behind a pinned <name>Length and report the unpinned ones");
+    .option("--expand-enumerations", "read every element behind a pinned <name>Length and report the unpinned ones")
+    .option(
+      "--trusted-explorer <host=chainId>",
+      "skip the chainId probe for an explorer host known to serve that chain; repeatable, or comma-separated",
+      (value: string, previous: string[]) => [...previous, value],
+      [] as string[],
+    );
 
   // A usage error under --json must reach the caller as a report, so commander may neither
   // print nor exit on its own; the flag is read off argv because parsing is what failed
@@ -71,6 +78,15 @@ export function parseCommandLineArguments() {
     logErrorAndExit(`Invalid --block value "${String(options.block)}": expected a block number or "latest"`);
   }
 
+  const trustedExplorers: Record<string, string> = {};
+  for (const item of (options.trustedExplorer as string[]).flatMap((value) => value.split(","))) {
+    const parsed = parseTrustedExplorer(item);
+    if (!parsed || (trustedExplorers[parsed[0]] ?? parsed[1]) !== parsed[1]) {
+      logErrorAndExit(`Invalid --trusted-explorer value "${item}": expected <host>=<chainId>, one chain per host`);
+    }
+    trustedExplorers[parsed[0]] = parsed[1];
+  }
+
   return {
     configPath,
     checkOnly,
@@ -83,5 +99,6 @@ export function parseCommandLineArguments() {
     block,
     observedPath: options.observed === undefined ? undefined : String(options.observed),
     expandEnumerations: Boolean(options.expandEnumerations),
+    trustedExplorers,
   };
 }
