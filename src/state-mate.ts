@@ -354,18 +354,22 @@ async function checkNetworkSection(sectionTitle: string, section: NetworkSection
   }
   const rpcUrl = readUrlOrFromEnvironment(section.rpcUrl);
   const provider = createProvider(rpcUrl);
+  // Log reads only, so never pinned: the pin is a bound on the ranges they ask for
+  const logsProvider = section.logsRpcUrl ? createProvider(readUrlOrFromEnvironment(section.logsRpcUrl)) : undefined;
   const chainId = normalizeChainId(section.chainId);
   setExplorerTokenEnv(section.explorerTokenEnv, section.explorerHostname);
   // assertProviderChain vouches for the RPC; the explorer is probed by the ABI pass, and only
   // when it has something to download
   await assertProviderChain(provider, chainId);
+  // logs of another chain would nominate nobody, and the scan would pass on silence
+  if (logsProvider) await assertProviderChain(logsProvider, chainId, "logs RPC");
   await pinSectionBlock(provider);
   if (context.observedPath) {
     const pinned = provider.pinned;
     const hash = typeof pinned?.tag === "object" ? pinned.tag.blockHash : undefined;
     beginObservedSection(sectionTitle, chainId, pinned?.number ?? (await provider.getBlockNumber()), !!pinned, hash);
   }
-  const contractSectionChecker = new ContractSectionValidator(provider, chainId);
+  const contractSectionChecker = new ContractSectionValidator(provider, chainId, logsProvider);
 
   for (const contractAlias in section.contracts) {
     const contractEntry = section.contracts[contractAlias];
