@@ -217,11 +217,12 @@ export abstract class SectionValidatorBase {
     let contractFunction: ReturnType<typeof contract.getFunction>;
     try {
       contractFunction = contract.getFunction(signature);
+      // `balanceOf: null` names no account, and a bare overloaded name names no function: a call
+      // would record ethers' complaint as a revert
+      if (contractFunction.fragment.inputs.length !== (args?.length ?? 0)) return;
     } catch {
       return;
     }
-    // `balanceOf: null` names no account; a bare call would record ethers' complaint as a revert
-    if (contractFunction.fragment.inputs.length !== (args?.length ?? 0)) return;
     setErrorContext({ method: `${signature}${args ? `(${args.toString()})` : ""}` });
     try {
       recordObservedCall(currentErrorContext, signature, args, {

@@ -224,6 +224,29 @@ describe("a check the config declines to assert", () => {
     assert.deepEqual(buildObservedDocument("state.yaml").sections, {});
   });
 
+  it("is not read when its bare name matches several overloads", async () => {
+    // ethers resolves the fragment lazily and throws for an ambiguous name; the run must go on
+    context.observedPath = "state.observed.yaml";
+    let calls = 0;
+    const overloaded = {
+      getFunction: () => ({
+        get fragment(): never {
+          throw new Error('ambiguous function description (i.e. matches "getFee(uint32)", "getFee(uint16)")');
+        },
+        staticCall: () => {
+          calls += 1;
+          return Promise.resolve("0x0");
+        },
+      }),
+    } as unknown as Contract;
+
+    await validator.run(overloaded, "getFee", { result: null } as unknown as StaticCallCheck);
+
+    assert.equal(calls, 0);
+    assert.deepEqual(buildObservedDocument("state.yaml").sections, {});
+    assert.deepEqual({ errors: stats.errors, skipped: stats.skipped }, { errors: 0, skipped: 1 });
+  });
+
   it("is not read when the run, not the config, supplied it", async () => {
     // implementationChecks fills every view of the implementation ABI the config leaves out with null
     context.observedPath = "state.observed.yaml";
